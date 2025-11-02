@@ -6,53 +6,72 @@ from fastapi import FastAPI, UploadFile, File
 
 app = FastAPI()
 
+def preprocess(img):
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    gray = cv2.bilateralFilter(gray, 11, 17, 17)
+    gray = cv2.threshold(gray, 120, 255, cv2.THRESH_BINARY)[1]
+    gray = cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_LINEAR)
+    return gray
 
-# ---------------------------------------------------------
-# KENYAN ID OCR PARSER
-# ---------------------------------------------------------
-def parse_kenyan_id(text: str):
-    lines = [line.strip() for line in text.split("\n") if line.strip()]
-    joined = " ".join(lines)
+def extract_fields(text):
+    out = {}
 
-    def extract(pattern):
-        match = re.search(pattern, joined, re.IGNORECASE)
-        return match.group(1).strip() if match else None
+    # Serial number (mostly 9 digits)
+    m = re.search(r"\b(\d{9})\b", text)
+    if m:
+        out["serial_number"] = m.group(1)
 
-    parsed = {
-        "serial_number": extract(r"SERIAL NUMBER[:\s]+([A-Za-z0-9]+)"),
-        "id_number": extract(r"(?:NUMBER|NO)[:\s]+([0-9]{5,})"),
-        "full_names": extract(r"FULL NAMES\s+([A-Z\s]+)"),
-        "date_of_birth": extract(r"DATE OF BIRTH\s+([0-9./-]+)"),
-        "sex": extract(r"SEX\s+([A-Z]+)"),
-        "district_of_birth": extract(r"DISTRICT OF BIRTH\s+([A-Z]+)"),
-        "place_of_issue": extract(r"PLACE OF ISSUE\s+([A-Z]+)"),
-        "date_of_issue": extract(r"DATE OF ISSUE\s+([0-9./-]+)"),
-        "holder_signature": extract(r"HOLDER'S SIGN\.?\s*([A-Za-z.]+)")
-    }
+    # ID number (7–8 digits usually)
+    m = re.search(r"\b(\d{7,8})\b", text)
+    if m:
+        out["id_number"] = m.group(1)
 
-    # remove empty or None fields
-    parsed = {k: v for k, v in parsed.items() if v}
+    # Full names (ALL CAPS words)
+    m = re.search(r"\b([A-Z]{3,}\s+[A-Z]{3,}\s+[A-Z]{3,})\b", text)
+    if m:
+        out["full_names"] = m.group(1)
 
-    return parsed
+    # Date of birth
+    m = re.search(r"\b(\d{2}\.\d{2}\.\d{2,4})\b", text)
+    if m:
+        out["date_of_birth"] = m.group(1)
 
+    # Sex
+    if "FEMALE" in text.upper():
+        out["sex"] = "FEMALE"
+    elif "MALE" in text.upper():
+        out["sex"] = "MALE"
 
-# ---------------------------------------------------------
-# OCR ENDPOINT
-# ---------------------------------------------------------
+    # District of birth (line after “DISTRICT OF BIRTH”)
+    m = re.search(r"DISTRICT OF BIRTH\s*\n*([A-Z]+)", text, re.IGNORECASE)
+    if m:
+        out["district_of_birth"] = m.group(1).upper()
+
+    # Place of issue
+    m = re.search(r"PLACE OF ISSUE\s*\n*([A-Z]+)", text, re.IGNORECASE)
+    if m:
+        out["place_of_issue"] = m.group(1).upper()
+
+    # Date of issue
+    m = re.search(r"DATE OF ISSUE\s*\n*(\d{2}\.\d{2}\.\d{2,4})", text, re.IGNORECASE)
+    if m:
+        out["date_of_issue"] = m.group(1)
+
+    return out
+
 @app.post("/ocr")
 async def ocr_endpoint(file: UploadFile = File(...)):
     img_bytes = await file.read()
-
-    # Load image
     img = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_COLOR)
-    if img is None:
-        return {"error": "Invalid image format"}
 
-    # OCR text
-    text = pytesseract.image_to_string(img)
+    processed = preprocess(img)
 
-    # Parse ID fields
-    parsed = parse_kenyan_id(text)
+    text = pytesseract.image_to_string(
+        processed,
+        config="--oem 3 --psm 6"
+    )
+
+    parsed = extract_fields(text.upper())
 
     return {
         "raw_text": text,
