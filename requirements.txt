@@ -1,6 +1,5 @@
 fastapi
-uvicorn[standard]
-easyocr
-pillow
+uvicorn
+pytesseract
+opencv-python-headless
 numpy
-torch

@@ -1,20 +1,13 @@
-FROM python:3.10-slim
+FROM python:3.10
 
-# System deps for EasyOCR + Pillow
-RUN apt-get update && apt-get install -y \
-    libgl1 \
-    libglib2.0-0 \
-    && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y tesseract-ocr libtesseract-dev
 
 WORKDIR /app
-COPY . .
 
-# Install CPU-only torch (saves 500MB+)
-RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu \
-    torch torchvision
+COPY requirements.txt .
 
 RUN pip install --no-cache-dir -r requirements.txt
 
-EXPOSE 8080
+COPY . .
 
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "1"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "10000"]

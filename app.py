@@ -1,28 +1,15 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import JSONResponse
-import easyocr
+import cv2
+import pytesseract
 import numpy as np
-from PIL import Image
-import io
+from fastapi import FastAPI, UploadFile, File
 
 app = FastAPI()
 
-reader = easyocr.Reader(['en'], gpu=False)
-
 @app.post("/ocr")
-async def ocr(file: UploadFile = File(...)):
-    if file.content_type.split('/')[0] != "image":
-        raise HTTPException(400, "Only image uploads allowed")
-
+async def ocr_endpoint(file: UploadFile = File(...)):
     img_bytes = await file.read()
-    pil_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-    np_img = np.array(pil_img)
+    img = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_COLOR)
 
-    results = reader.readtext(np_img)
+    text = pytesseract.image_to_string(img)
 
-    out = [{"text": t, "conf": float(c)} for (_, t, c) in results]
-    return JSONResponse({"results": out})
-
-@app.get("/")
-def root():
-    return {"status": "ok"}
+    return {"text": text}
