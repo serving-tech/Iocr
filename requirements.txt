@@ -4,4 +4,4 @@ pytesseract
 opencv-python-headless
 numpy
 python-multipart
-python-mrz
+mrz
