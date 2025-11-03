@@ -1,7 +1,6 @@
-fastapi
-uvicorn
-pytesseract
-opencv-python-headless
-numpy
-python-multipart
-mrz
+Flask==3.0.0
+opencv-python-headless==4.8.1.78
+numpy==1.24.3
+pytesseract==0.3.10
+Pillow==10.1.0
+gunicorn==21.2.0
