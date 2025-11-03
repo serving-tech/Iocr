@@ -3,13 +3,12 @@ import cv2
 import numpy as np
 import pytesseract
 import re
-from datetime import datetime
 import os
 import logging
 
 app = Flask(__name__)
 
-# Configure logging
+# Logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -28,23 +27,21 @@ class MRZParser:
         }
 
     def clean_line(self, line):
-        """Aggressive cleaning of OCR output"""
+        """Aggressive OCR cleaning"""
         line = line.upper()
-        # Replace common OCR errors
         line = line.replace('O', '0').replace('I', '1').replace('B', '8')
         line = line.replace('S', '5').replace('Z', '2').replace('G', '6')
         line = line.replace('«', '<').replace('»', '<').replace('>', '<')
         line = line.replace('|', '1').replace('!', '1').replace(' ', '')
-        # Keep only valid MRZ chars
         line = re.sub(r'[^A-Z0-9<]', '', line)
         return line
 
     def detect_mrz_region(self, image):
-        """Detect MRZ using multiple strategies"""
+        """Detect MRZ with fallback"""
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         h, w = gray.shape
 
-        # Strategy 1: Morphological closing for text blocks
+        # Morphological detection
         _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 3))
         morph = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=2)
@@ -55,32 +52,27 @@ class MRZParser:
             x, y, cw, ch = cv2.boundingRect(cnt)
             aspect = cw / float(ch) if ch > 0 else 0
             area = cw * ch
-            if (aspect > 8 and  # Very wide
-                ch < h * 0.15 and
-                y > h * 0.5 and
-                area > 5000):
+            if (aspect > 8 and ch < h * 0.15 and y > h * 0.5 and area > 5000):
                 candidates.append((x, y, cw, ch))
 
         if candidates:
-            # Largest by area
             candidates.sort(key=lambda x: x[2] * x[3], reverse=True)
             x, y, cw, ch = candidates[0]
             pad = 15
             return gray[max(0, y - pad):min(h, y + ch + pad),
                         max(0, x - pad):min(w, x + cw + pad)]
 
-        # Strategy 2: Bottom 30% fallback
+        # Fallback: bottom 30%
         logger.info("Using bottom region fallback")
         return gray[int(h * 0.7):h, 0:w]
 
     def preprocess_mrz(self, region):
-        """Enhanced preprocessing"""
-        # Resize
+        """Enhanced preprocessing with auto-invert"""
         scale = 3.0
         h, w = region.shape
         resized = cv2.resize(region, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
 
-        # Multiple thresholding
+        # Try both thresholding
         thresh1 = cv2.adaptiveThreshold(resized, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
                                        cv2.THRESH_BINARY, 11, 2)
         thresh2 = cv2.threshold(resized, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
@@ -89,20 +81,23 @@ class MRZParser:
         # Denoise
         denoised = cv2.fastNlMeansDenoising(thresh, None, h=15, templateWindowSize=7, searchWindowSize=21)
 
-        # Slight dilation to connect broken chars
+        # Auto-invert if text is white
+        if np.mean(denoised) > 127:
+            denoised = cv2.bitwise_not(denoised)
+
+        # Connect broken chars
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
         final = cv2.dilate(denoised, kernel, iterations=1)
 
         return final
 
     def extract_mrz_lines(self, preprocessed):
-        """Extract and normalize MRZ lines"""
+        """Extract and normalize lines"""
         custom_config = r'--oem 3 --psm 6 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789<'
         text = pytesseract.image_to_string(preprocessed, config=custom_config)
 
         raw_lines = [self.clean_line(line) for line in text.split('\n') if line.strip() and len(self.clean_line(line)) > 20]
 
-        # Group by approximate length
         td1_lines = [l.ljust(30, '<')[:30] for l in raw_lines if 25 <= len(l) <= 35]
         td2_lines = [l.ljust(36, '<')[:36] for l in raw_lines if 32 <= len(l) <= 40]
         td3_lines = [l.ljust(44, '<')[:44] for l in raw_lines if 38 <= len(l) <= 48]
@@ -110,7 +105,7 @@ class MRZParser:
         return td1_lines, td2_lines, td3_lines
 
     def identify_mrz_type(self, td1_lines, td2_lines, td3_lines):
-        """Identify MRZ type based on line count and pattern"""
+        """Identify type by line count"""
         if len(td1_lines) >= 3:
             return 'TD1', td1_lines[:3]
         if len(td3_lines) >= 2:
@@ -120,26 +115,33 @@ class MRZParser:
         return None, None
 
     def validate_check_digit(self, field, check_digit_char):
-        """Validate MRZ check digit"""
-        if check_digit_char == '<':
+        """Safe check digit validation"""
+        if not check_digit_char or check_digit_char == '<':
             return True
-        weights = [7, 3, 1]
-        total = 0
-        for i, c in enumerate(field):
-            if c == '<':
-                val = 0
-            elif c.isdigit():
-                val = int(c)
-            else:
-                val = ord(c) - ord('A') + 10
-            total += val * weights[i % 3]
-        return (total % 10) == int(check_digit_char)
+        if not check_digit_char.isdigit():
+            return False
+        try:
+            weights = [7, 3, 1]
+            total = 0
+            for i, c in enumerate(field):
+                if c == '<':
+                    val = 0
+                elif c.isdigit():
+                    val = int(c)
+                elif c.isalpha():
+                    val = ord(c) - ord('A') + 10
+                else:
+                    return False
+                total += val * weights[i % 3]
+            return (total % 10) == int(check_digit_char)
+        except:
+            return False
 
     def parse_date(self, date_str):
-        """Parse YYMMDD → YYYY-MM-DD"""
+        """Safe YYMMDD → YYYY-MM-DD"""
+        if not date_str or len(date_str) != 6 or not date_str.isdigit():
+            return None
         try:
-            if len(date_str) != 6 or not date_str.isdigit():
-                return None
             yy, mm, dd = int(date_str[0:2]), int(date_str[2:4]), int(date_str[4:6])
             if not (1 <= mm <= 12 and 1 <= dd <= 31):
                 return None
@@ -160,25 +162,24 @@ class MRZParser:
             'document_type': l1[0:2].replace('<', ''),
             'issuing_country': l1[2:5],
             'document_number': l1[5:14].replace('<', ''),
-            'check_document_number': l1[14],
+            'check_document_number': l1[14] if len(l1) > 14 else '',
             'birth_date': self.parse_date(l2[0:6]),
-            'check_birth_date': l2[6],
-            'sex': l2[7] if l2[7] in 'MF<' else '',
+            'check_birth_date': l2[6] if len(l2) > 6 else '',
+            'sex': l2[7] if len(l2) > 7 and l2[7] in 'MF<' else '',
             'expiry_date': self.parse_date(l2[8:14]),
-            'check_expiry_date': l2[14],
-            'nationality': l2[15:18],
-            'optional1': l2[18:29].replace('<', ''),
-            'check_composite': l2[29],
+            'check_expiry_date': l2[14] if len(l2) > 14 else '',
+            'nationality': l2[15:18] if len(l2) > 18 else '',
+            'optional1': l2[18:29].replace('<', '') if len(l2) > 29 else '',
+            'check_composite': l2[29] if len(l2) > 29 else '',
             'names': self.parse_names(l3),
             'mrz_type': 'TD1'
         }
-        # Validate check digits
-        valid = (
-            self.validate_check_digit(l1[5:14], l1[14]) and
-            self.validate_check_digit(l2[0:6], l2[6]) and
-            self.validate_check_digit(l2[8:14], l2[14]) and
-            self.validate_check_digit(l2[0:29], l2[29])
-        )
+        # Validate only if fields exist
+        valid = True
+        if len(l1) > 14: valid &= self.validate_check_digit(l1[5:14], l1[14])
+        if len(l2) > 6: valid &= self.validate_check_digit(l2[0:6], l2[6])
+        if len(l2) > 14: valid &= self.validate_check_digit(l2[8:14], l2[14])
+        if len(l2) > 29: valid &= self.validate_check_digit(l2[0:29], l2[29])
         data['check_digits_valid'] = valid
         return data
 
@@ -190,30 +191,28 @@ class MRZParser:
             'issuing_country': l1[2:5],
             'names': self.parse_names(l1[5:length]),
             'document_number': l2[0:9].replace('<', ''),
-            'check_document_number': l2[9],
-            'nationality': l2[10:13],
+            'check_document_number': l2[9] if len(l2) > 9 else '',
+            'nationality': l2[10:13] if len(l2) > 13 else '',
             'birth_date': self.parse_date(l2[13:19]),
-            'check_birth_date': l2[19],
-            'sex': l2[20] if l2[20] in 'MF<' else '',
+            'check_birth_date': l2[19] if len(l2) > 19 else '',
+            'sex': l2[20] if len(l2) > 20 and l2[20] in 'MF<' else '',
             'expiry_date': self.parse_date(l2[21:27]),
-            'check_expiry_date': l2[27],
-            'optional': l2[28:length].replace('<', ''),
-            'check_composite': l2[length-1] if mrz_type == 'TD3' else None,
+            'check_expiry_date': l2[27] if len(l2) > 27 else '',
+            'optional': l2[28:length].replace('<', '') if len(l2) > 28 else '',
+            'check_composite': l2[length-1] if mrz_type == 'TD3' and len(l2) >= length else None,
             'mrz_type': mrz_type
         }
         # Validate
-        valid = (
-            self.validate_check_digit(l2[0:9], l2[9]) and
-            self.validate_check_digit(l2[13:19], l2[19]) and
-            self.validate_check_digit(l2[21:27], l2[27])
-        )
-        if mrz_type == 'TD3':
-            valid = valid and self.validate_check_digit(l2[0:36] + l1[0:9], l2[43])
+        valid = True
+        if len(l2) > 9: valid &= self.validate_check_digit(l2[0:9], l2[9])
+        if len(l2) > 19: valid &= self.validate_check_digit(l2[13:19], l2[19])
+        if len(l2) > 27: valid &= self.validate_check_digit(l2[21:27], l2[27])
+        if mrz_type == 'TD3' and len(l2) >= 43:
+            valid &= self.validate_check_digit(l2[0:36] + l1[0:9], l2[43])
         data['check_digits_valid'] = valid
         return data
 
     def process_image(self, image):
-        """Main pipeline"""
         try:
             # 1. Detect region
             region = self.detect_mrz_region(image)
@@ -228,13 +227,19 @@ class MRZParser:
             # 3. Extract lines
             td1_lines, td2_lines, td3_lines = self.extract_mrz_lines(preprocessed)
 
-            # 4. Identify type
+            # 4. Early reject: too few lines
+            total_lines = len(td1_lines) + len(td2_lines) + len(td3_lines)
+            if total_lines < 2:
+                logger.warning("OCR yielded too few valid lines")
+                return None
+
+            # 5. Identify type
             mrz_type, lines = self.identify_mrz_type(td1_lines, td2_lines, td3_lines)
             if not mrz_type or len(lines) == 0:
                 logger.warning("MRZ type not identified")
                 return None
 
-            # 5. Parse
+            # 6. Parse
             if mrz_type == 'TD1':
                 result = self.parse_td1(lines)
             else:
