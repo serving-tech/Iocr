@@ -1,189 +1,128 @@
 import cv2
-import pytesseract
 import numpy as np
-import re
+import pytesseract
 from fastapi import FastAPI, UploadFile, File
+from mrz.checker.td3 import TD3CodeChecker
+from mrz.base.codeline_tds import TD3CodeLine
 from pydantic import BaseModel
-from typing import Dict, Any
 
-# -------------------------------------------------
-app = FastAPI(title="Kenyan ID MRZ OCR – Back Side Only")
+app = FastAPI(title="MRZ OCR API")
 
-
-# -------------------------------------------------
-class MRZResult(BaseModel):
-    raw_mrz: str
-    mrz_lines: Dict[str, str]
-    parsed: Dict[str, Any]
-    checks: Dict[str, bool]
+class MRZResponse(BaseModel):
+    success: bool
+    message: str | None = None
+    mrz_raw: list[str] | None = None
+    parsed: dict | None = None
 
 
-# -------------------------------------------------
-# 1. MRZ PRE-PROCESSING
-def preprocess_mrz(img: np.ndarray) -> np.ndarray:
+# -----------------------------
+# MRZ PREPROCESSING
+# -----------------------------
+def preprocess_mrz(img):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-    # mild denoise but preserve edges
+    # remove noise
     gray = cv2.GaussianBlur(gray, (3, 3), 0)
 
-    # black-hat to highlight dark characters
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (13, 3))
-    blackhat = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, kernel)
+    # increase contrast
+    gray = cv2.equalizeHist(gray)
 
-    enhanced = cv2.addWeighted(gray, 1.0, blackhat, 1.5, 0)
+    # strong threshold
+    _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-    # up-scale for Tesseract
-    enhanced = cv2.resize(enhanced, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+    # upscale for better OCR
+    th = cv2.resize(th, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
 
-    # adaptive threshold
-    th = cv2.adaptiveThreshold(
-        enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY, 31, 15
-    )
-
-    # close tiny gaps
-    close = cv2.morphologyEx(
-        th, cv2.MORPH_CLOSE,
-        cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-    )
-    return close
+    return th
 
 
-# -------------------------------------------------
-# 2. Extract MRZ text (bottom ~30% of the card)
-def extract_mrz(img: np.ndarray) -> str:
-    h, w = img.shape[:2]
-    mrz_region = img[int(h * 0.70):h, 0:w]
+# -----------------------------
+# MRZ REGION DETECTION
+# -----------------------------
+def detect_mrz_region(image):
+    h = image.shape[0]
+    mrz_height = int(h * 0.28)  # MRZ is bottom ~25–30%
 
-    pre = preprocess_mrz(mrz_region)
+    mrz_region = image[h - mrz_height : h]
+    return mrz_region
 
+
+# -----------------------------
+# OCR MRZ
+# -----------------------------
+def ocr_mrz(img):
     config = (
         "--oem 1 --psm 6 "
         "-c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789<"
     )
-    raw = pytesseract.image_to_string(pre, config=config)
-    raw = raw.replace(" ", "")
-    return raw.strip()
+    text = pytesseract.image_to_string(img, config=config)
+    return text.strip().split("\n")
 
 
-# -------------------------------------------------
-# 3. Clean & split into two 44-char lines
-def clean_mrz(raw: str) -> str:
-    raw = raw.upper()
-    raw = re.sub(r"[^A-Z0-9<\n]", "", raw)
-    return raw
+# -----------------------------
+# PARSE MRZ USING python-mrz
+# -----------------------------
+def parse_mrz(lines: list[str]):
+    if len(lines) < 2 or not lines[0] or not lines[1]:
+        return None, "MRZ lines unreadable"
 
+    try:
+        line1 = TD3CodeLine(lines[0])
+        line2 = TD3CodeLine(lines[1])
+        checker = TD3CodeChecker(lines[0], lines[1])
+    except Exception as e:
+        return None, f"Parsing error: {str(e)}"
 
-def split_mrz(raw: str):
-    raw = clean_mrz(raw)
-    lines = [ln for ln in raw.splitlines() if ln.strip()]
-
-    # -------------------------------------------------
-    # Prefer the last two lines if they look long enough
-    if len(lines) >= 2 and len(lines[-1]) >= 40:
-        l1 = lines[-2][:44].ljust(44, "<")
-        l2 = lines[-1][:44].ljust(44, "<")
-        return l1, l2
-
-    # -------------------------------------------------
-    # Fallback: merge everything and slice
-    merged = "".join(lines)
-    merged = re.sub(r"[^A-Z0-9<]", "", merged)
-    merged = merged.ljust(88, "<")[:88]
-
-    return merged[:44], merged[44:88]
-
-
-# -------------------------------------------------
-# 4. MRZ CHECKSUM (ICAO 9303 – < = 0)
-def mrz_checksum(s: str) -> int:
-    values = {c: i for i, c in enumerate("0123456789<")}
-    for i, ch in enumerate("ABCDEFGHIJKLMNOPQRSTUVWXYZ", start=10):
-        values[ch] = i
-
-    weights = [7, 3, 1]
-    total = 0
-    for i, ch in enumerate(s):
-        total += values.get(ch, 0) * weights[i % 3]
-    return total % 10
-
-
-def safe_int(digit: str) -> int:
-    """Return digit as int or 0 if it is '<'."""
-    return 0 if digit == "<" else int(digit)
-
-
-# -------------------------------------------------
-# 5. Parse TD-3 (Kenyan ID back uses TD-3 layout)
-def parse_td3(line1: str, line2: str):
-    # ---- line 1 -------------------------------------------------
-    doc_type = line1[0:2]
-    country = line1[2:5]
-
-    names_field = line1[5:].rstrip("<")
-    parts = names_field.split("<<")
-    surname = parts[0].replace("<", " ").strip()
-    given = parts[1].replace("<", " ").strip() if len(parts) > 1 else ""
-
-    # ---- line 2 -------------------------------------------------
-    passport = line2[0:9]
-    passport_cd = line2[9]
-    nationality = line2[10:13]
-    birth = line2[13:19]
-    birth_cd = line2[19]
-    sex = line2[20]
-    expiry = line2[21:27]
-    expiry_cd = line2[27]
-    personal = line2[28:42]
-    personal_cd = line2[42]
-    final_cd = line2[43]
-
-    # ---- checksums ---------------------------------------------
-    checks = {
-        "passport_ok": mrz_checksum(passport) == safe_int(passport_cd),
-        "birth_ok": mrz_checksum(birth) == safe_int(birth_cd),
-        "expiry_ok": mrz_checksum(expiry) == safe_int(expiry_cd),
-        "personal_ok": mrz_checksum(personal) == safe_int(personal_cd),
-        # composite check (passport+cd+birth+cd+expiry+cd+personal+cd)
-        "final_ok": mrz_checksum(
-            passport + passport_cd + birth + birth_cd + expiry + expiry_cd + personal + personal_cd
-        )
-        == safe_int(final_cd),
-    }
+    if not checker.valid:
+        return None, "Invalid MRZ checksum"
 
     parsed = {
-        "document_type": doc_type,
-        "country": country,
-        "surname": surname,
-        "given_names": given,
-        "document_number": passport,
-        "nationality": nationality,
-        "date_of_birth": birth,
-        "sex": sex,
-        "date_of_expiry": expiry,
-        "personal_number": personal,
+        "document_type": line1.document_type,
+        "country": line1.issuing_country,
+        "surname": line1.surname,
+        "given_names": line1.given_names,
+        "document_number": line2.document_number,
+        "nationality": line2.nationality,
+        "date_of_birth": line2.birth_date,
+        "sex": line2.sex,
+        "date_of_expiry": line2.expiry_date,
+        "personal_number": line2.optional_data
     }
 
-    return parsed, checks
+    return parsed, None
 
 
-# -------------------------------------------------
-@app.post("/mrz", response_model=MRZResult)
-async def mrz_endpoint(file: UploadFile = File(...)):
-    contents = await file.read()
-    npimg = np.frombuffer(contents, np.uint8)
-    img = cv2.imdecode(npimg, cv2.IMREAD_COLOR)
+# -----------------------------
+# FASTAPI ENDPOINT
+# -----------------------------
+@app.post("/mrz", response_model=MRZResponse)
+async def read_mrz(file: UploadFile = File(...)):
+    contents = np.frombuffer(await file.read(), np.uint8)
+    img = cv2.imdecode(contents, cv2.IMREAD_COLOR)
     if img is None:
-        raise ValueError("Invalid image")
+        return MRZResponse(success=False, message="Invalid image format")
 
-    raw = extract_mrz(img)
-    l1, l2 = split_mrz(raw)
+    mrz_region = detect_mrz_region(img)
+    preprocessed = preprocess_mrz(mrz_region)
+    lines = ocr_mrz(preprocessed)
 
-    parsed, checks = parse_td3(l1, l2)
+    # clean empty lines
+    lines = [l for l in lines if l.strip()]
 
-    return MRZResult(
-        raw_mrz=raw,
-        mrz_lines={"line1": l1, "line2": l2},
-        parsed=parsed,
-        checks=checks,
+    if len(lines) < 2:
+        return MRZResponse(
+            success=False,
+            message="MRZ not detected. Ensure you upload the BACK side of the ID."
+        )
+
+    parsed, err = parse_mrz(lines)
+
+    if err:
+        return MRZResponse(success=False, message=err, mrz_raw=lines)
+
+    return MRZResponse(
+        success=True,
+        message="MRZ extracted successfully",
+        mrz_raw=lines,
+        parsed=parsed
     )
